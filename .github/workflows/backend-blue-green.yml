@@ -127,7 +127,7 @@ jobs:
               --rm -i \
               --restart=Never \
               --image=curlimages/curl:8.8.0 \
-              -- curl -f http://$SERVICE_NAME-$TARGET_COLOR-preview$HEALTH_PATH
+              -- curl -f http://$SERVICE_NAME-$TARGET_COLOR-preview:8000$HEALTH_PATH
 
             cat > /tmp/$SERVICE_NAME-service-patch.json <<PATCH
           {
@@ -157,7 +157,7 @@ jobs:
               --rm -i \
               --restart=Never \
               --image=curlimages/curl:8.8.0 \
-              -- curl -f http://$SERVICE_NAME$HEALTH_PATH
+              -- curl -f http://$SERVICE_NAME:8000$HEALTH_PATH
 
             kubectl scale deployment $SERVICE_NAME-$OLD_COLOR --replicas=1
 
