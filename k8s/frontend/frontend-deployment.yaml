@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: new-event-frontend
+  labels:
+    app: new-event-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: new-event-frontend
+  template:
+    metadata:
+      labels:
+        app: new-event-frontend
+    spec:
+      containers:
+        - name: new-event-frontend
+          image: charukaiit/new-event-frontend:v1
+          ports:
+            - containerPort: 80
