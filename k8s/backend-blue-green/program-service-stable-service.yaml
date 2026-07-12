@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: program-service
+spec:
+  type: ClusterIP
+  selector:
+    app: program-service
+    color: blue
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-service-green
+  labels:
+    app: event-service
+    color: green
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: event-service
+      color: green
+  template:
+    metadata:
+      labels:
+        app: event-service
+        color: green
+    spec:
+      containers:
+        - name: event-service
+          image: charukaiit/event-service:v2
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20

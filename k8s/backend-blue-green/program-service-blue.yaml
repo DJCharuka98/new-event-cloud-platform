@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: program-service-blue
+  labels:
+    app: program-service
+    color: blue
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: program-service
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: program-service
+        color: blue
+    spec:
+      containers:
+        - name: program-service
+          image: charukaiit/program-service:v2
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20

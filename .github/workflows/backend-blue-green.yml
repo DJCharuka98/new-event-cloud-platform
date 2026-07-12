@@ -1,0 +1,182 @@
+name: Backend Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "services/**"
+      - "k8s/backend-blue-green/**"
+      - ".github/workflows/backend-blue-green.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image names
+        run: |
+          echo "EVENT_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/event-service:${{ github.sha }}" >> $GITHUB_ENV
+          echo "PROGRAM_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/program-service:${{ github.sha }}" >> $GITHUB_ENV
+          echo "REGISTRATION_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/registration-service:${{ github.sha }}" >> $GITHUB_ENV
+          echo "ANALYTICS_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/analytics-service:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build backend Docker images
+        run: |
+          docker build -t "$EVENT_IMAGE" ./services/event-service
+          docker build -t "$PROGRAM_IMAGE" ./services/program-service
+          docker build -t "$REGISTRATION_IMAGE" ./services/registration-service
+          docker build -t "$ANALYTICS_IMAGE" ./services/analytics-service
+
+      - name: Push backend Docker images
+        run: |
+          docker push "$EVENT_IMAGE"
+          docker push "$PROGRAM_IMAGE"
+          docker push "$REGISTRATION_IMAGE"
+          docker push "$ANALYTICS_IMAGE"
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf "%s\n" "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/new-event-key.pem
+          chmod 600 ~/.ssh/new-event-key.pem
+
+          echo "Testing SSH connection to EC2..."
+          nc -vz "${{ secrets.EC2_HOST }}" 22
+
+          echo "Adding EC2 host to known_hosts..."
+          ssh-keyscan -T 30 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Copy backend blue-green manifests to EC2
+        run: |
+          scp -i ~/.ssh/new-event-key.pem -r k8s/backend-blue-green \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/new-event-k8s/
+
+      - name: Deploy backend using blue-green strategy
+        run: |
+          ssh -i ~/.ssh/new-event-key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+            "EVENT_IMAGE='$EVENT_IMAGE' PROGRAM_IMAGE='$PROGRAM_IMAGE' REGISTRATION_IMAGE='$REGISTRATION_IMAGE' ANALYTICS_IMAGE='$ANALYTICS_IMAGE' bash -s" <<'EOF'
+          set -e
+
+          export KUBECONFIG=$HOME/.kube/config
+
+          cd ~/new-event-k8s/backend-blue-green
+
+          deploy_service() {
+            SERVICE_NAME=$1
+            CONTAINER_NAME=$2
+            IMAGE=$3
+            HEALTH_PATH=$4
+
+            echo "----------------------------------------"
+            echo "Deploying $SERVICE_NAME"
+            echo "Image: $IMAGE"
+            echo "Health path: $HEALTH_PATH"
+            echo "----------------------------------------"
+
+            if ! kubectl get deployment $SERVICE_NAME-blue >/dev/null 2>&1; then
+              kubectl apply -f $SERVICE_NAME-blue.yaml
+            fi
+
+            if ! kubectl get deployment $SERVICE_NAME-green >/dev/null 2>&1; then
+              kubectl apply -f $SERVICE_NAME-green.yaml
+            fi
+
+            kubectl apply -f $SERVICE_NAME-preview-services.yaml
+
+            if ! kubectl get service $SERVICE_NAME >/dev/null 2>&1; then
+              kubectl apply -f $SERVICE_NAME-stable-service.yaml
+            fi
+
+            ACTIVE_COLOR=$(kubectl get service $SERVICE_NAME -o jsonpath='{.spec.selector.color}')
+
+            if [ -z "$ACTIVE_COLOR" ]; then
+              echo "No active color found for $SERVICE_NAME. Defaulting to blue."
+              ACTIVE_COLOR="blue"
+              kubectl patch service $SERVICE_NAME \
+                --type=merge \
+                -p "{\"spec\":{\"selector\":{\"app\":\"$SERVICE_NAME\",\"color\":\"blue\"}}}"
+            fi
+
+            if [ "$ACTIVE_COLOR" = "blue" ]; then
+              TARGET_COLOR="green"
+              OLD_COLOR="blue"
+            else
+              TARGET_COLOR="blue"
+              OLD_COLOR="green"
+            fi
+
+            echo "$SERVICE_NAME active color before deployment: $ACTIVE_COLOR"
+            echo "$SERVICE_NAME target color: $TARGET_COLOR"
+
+            kubectl set image deployment/$SERVICE_NAME-$TARGET_COLOR \
+              $CONTAINER_NAME=$IMAGE
+
+            kubectl scale deployment $SERVICE_NAME-$TARGET_COLOR --replicas=1
+
+            kubectl rollout status deployment/$SERVICE_NAME-$TARGET_COLOR --timeout=180s
+
+            kubectl run $SERVICE_NAME-smoke-test \
+              --rm -i \
+              --restart=Never \
+              --image=curlimages/curl:8.8.0 \
+              -- curl -f http://$SERVICE_NAME-$TARGET_COLOR-preview$HEALTH_PATH
+
+            cat > /tmp/$SERVICE_NAME-service-patch.json <<PATCH
+          {
+            "spec": {
+              "selector": {
+                "app": "$SERVICE_NAME",
+                "color": "$TARGET_COLOR"
+              }
+            }
+          }
+          PATCH
+
+            kubectl patch service $SERVICE_NAME \
+              --type=merge \
+              --patch-file /tmp/$SERVICE_NAME-service-patch.json
+
+            CURRENT_COLOR=$(kubectl get service $SERVICE_NAME -o jsonpath='{.spec.selector.color}')
+
+            echo "$SERVICE_NAME current live color after patch: $CURRENT_COLOR"
+
+            if [ "$CURRENT_COLOR" != "$TARGET_COLOR" ]; then
+              echo "$SERVICE_NAME blue-green switch failed. Expected $TARGET_COLOR but got $CURRENT_COLOR"
+              exit 1
+            fi
+
+            kubectl run $SERVICE_NAME-live-smoke-test \
+              --rm -i \
+              --restart=Never \
+              --image=curlimages/curl:8.8.0 \
+              -- curl -f http://$SERVICE_NAME$HEALTH_PATH
+
+            kubectl scale deployment $SERVICE_NAME-$OLD_COLOR --replicas=1
+
+            echo "$SERVICE_NAME deployment completed. Live color is now: $TARGET_COLOR"
+          }
+
+          kubectl get nodes
+
+          deploy_service "event-service" "event-service" "$EVENT_IMAGE" "/"
+          deploy_service "program-service" "program-service" "$PROGRAM_IMAGE" "/"
+          deploy_service "registration-service" "registration-service" "$REGISTRATION_IMAGE" "/"
+          deploy_service "analytics-service" "analytics-service" "$ANALYTICS_IMAGE" "/analytics/health"
+
+          echo "Backend deployments:"
+          kubectl get deployments | grep service
+
+          echo "Backend services:"
+          kubectl get svc | grep service
+
+          echo "Backend pods:"
+          kubectl get pods --show-labels | grep service
+          EOF

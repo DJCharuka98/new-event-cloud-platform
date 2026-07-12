@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-service-blue-preview
+spec:
+  type: ClusterIP
+  selector:
+    app: analytics-service
+    color: blue
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-service-green-preview
+spec:
+  type: ClusterIP
+  selector:
+    app: analytics-service
+    color: green
+  ports:
+    - port: 8000
+      targetPort: 8000
