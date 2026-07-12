@@ -57,7 +57,10 @@ jobs:
           kubectl apply -f frontend-blue.yaml
           kubectl apply -f frontend-green.yaml
           kubectl apply -f frontend-preview-services.yaml
-          kubectl apply -f frontend-service.yaml
+
+          if ! kubectl get service new-event-frontend-service >/dev/null 2>&1; then
+            kubectl apply -f frontend-stable-service.yaml
+          fi
 
           ACTIVE_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
 
@@ -97,8 +100,6 @@ jobs:
             echo "Blue-green switch failed. Expected $TARGET_COLOR but got $CURRENT_COLOR"
             exit 1
           fi
-
-          kubectl scale deployment new-event-frontend-$OLD_COLOR --replicas=1
 
           echo "Deployment completed. Live color is now: $TARGET_COLOR"
           kubectl get pods -l app=new-event-frontend --show-labels
