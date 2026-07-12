@@ -89,6 +89,15 @@ jobs:
           kubectl patch service new-event-frontend-service \
             -p "{\"spec\":{\"selector\":{\"app\":\"new-event-frontend\",\"color\":\"$TARGET_COLOR\"}}}"
 
+          CURRENT_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
+
+          echo "Current live color after patch: $CURRENT_COLOR"
+
+          if [ "$CURRENT_COLOR" != "$TARGET_COLOR" ]; then
+            echo "Blue-green switch failed. Expected $TARGET_COLOR but got $CURRENT_COLOR"
+            exit 1
+          fi
+
           kubectl scale deployment new-event-frontend-$OLD_COLOR --replicas=1
 
           echo "Deployment completed. Live color is now: $TARGET_COLOR"
