@@ -1,0 +1,96 @@
+name: Frontend Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - "k8s/frontend-blue-green/**"
+      - ".github/workflows/frontend-blue-green.yml"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        run: |
+          echo "IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/new-event-frontend:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build frontend Docker image
+        run: |
+          docker build -t "$IMAGE" ./frontend
+
+      - name: Push frontend Docker image
+        run: |
+          docker push "$IMAGE"
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/new-event-key.pem
+          chmod 600 ~/.ssh/new-event-key.pem
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Copy blue-green manifests to EC2
+        run: |
+          scp -i ~/.ssh/new-event-key.pem -r k8s/frontend-blue-green \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/new-event-k8s/
+
+      - name: Deploy using blue-green strategy
+        run: |
+          ssh -i ~/.ssh/new-event-key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "IMAGE='$IMAGE' bash -s" <<'EOF'
+          set -e
+
+          export KUBECONFIG=$HOME/.kube/config
+
+          cd ~/new-event-k8s/frontend-blue-green
+
+          kubectl apply -f frontend-blue.yaml
+          kubectl apply -f frontend-green.yaml
+          kubectl apply -f frontend-preview-services.yaml
+          kubectl apply -f frontend-service.yaml
+
+          ACTIVE_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
+
+          if [ "$ACTIVE_COLOR" = "blue" ]; then
+            TARGET_COLOR="green"
+            OLD_COLOR="blue"
+          else
+            TARGET_COLOR="blue"
+            OLD_COLOR="green"
+          fi
+
+          echo "Active color: $ACTIVE_COLOR"
+          echo "Deploying new image to: $TARGET_COLOR"
+          echo "Image: $IMAGE"
+
+          kubectl set image deployment/new-event-frontend-$TARGET_COLOR \
+            new-event-frontend=$IMAGE
+
+          kubectl scale deployment new-event-frontend-$TARGET_COLOR --replicas=1
+
+          kubectl rollout status deployment/new-event-frontend-$TARGET_COLOR --timeout=180s
+
+          kubectl run frontend-smoke-test \
+            --rm -i \
+            --restart=Never \
+            --image=curlimages/curl:8.8.0 \
+            -- curl -f http://new-event-frontend-$TARGET_COLOR-preview/
+
+          kubectl patch service new-event-frontend-service \
+            -p "{\"spec\":{\"selector\":{\"app\":\"new-event-frontend\",\"color\":\"$TARGET_COLOR\"}}}"
+
+          kubectl scale deployment new-event-frontend-$OLD_COLOR --replicas=1
+
+          echo "Deployment completed. Live color is now: $TARGET_COLOR"
+          kubectl get pods -l app=new-event-frontend --show-labels
+          EOF
