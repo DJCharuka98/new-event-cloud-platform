@@ -1,6 +1,8 @@
 name: Backend Blue-Green Deployment
 
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - main
@@ -69,6 +71,49 @@ jobs:
 
           cd ~/new-event-k8s/backend-blue-green
 
+          run_smoke_test() {
+            TEST_NAME=$1
+            TEST_URL=$2
+
+            echo "Running smoke test: $TEST_NAME"
+            echo "URL: $TEST_URL"
+
+            kubectl delete pod "$TEST_NAME" --ignore-not-found=true >/dev/null 2>&1 || true
+            kubectl wait --for=delete pod/"$TEST_NAME" --timeout=30s >/dev/null 2>&1 || true
+
+            kubectl run "$TEST_NAME" \
+              --restart=Never \
+              --image=curlimages/curl:8.8.0 \
+              --command -- sh -c "curl -fsS '$TEST_URL'"
+
+            for i in $(seq 1 60); do
+              PHASE=$(kubectl get pod "$TEST_NAME" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+
+              if [ "$PHASE" = "Succeeded" ]; then
+                echo "Smoke test succeeded: $TEST_NAME"
+                kubectl logs "$TEST_NAME" || true
+                kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+                return 0
+              fi
+
+              if [ "$PHASE" = "Failed" ]; then
+                echo "Smoke test failed: $TEST_NAME"
+                kubectl logs "$TEST_NAME" || true
+                kubectl describe pod "$TEST_NAME" || true
+                kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+                return 1
+              fi
+
+              sleep 2
+            done
+
+            echo "Smoke test timed out: $TEST_NAME"
+            kubectl logs "$TEST_NAME" || true
+            kubectl describe pod "$TEST_NAME" || true
+            kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+            return 1
+          }
+
           deploy_service() {
             SERVICE_NAME=$1
             CONTAINER_NAME=$2
@@ -81,26 +126,31 @@ jobs:
             echo "Health path: $HEALTH_PATH"
             echo "----------------------------------------"
 
-            if ! kubectl get deployment $SERVICE_NAME-blue >/dev/null 2>&1; then
-              kubectl apply -f $SERVICE_NAME-blue.yaml
+            echo "Ensuring blue deployment exists..."
+            if ! kubectl get deployment "$SERVICE_NAME-blue" >/dev/null 2>&1; then
+              kubectl apply -f "$SERVICE_NAME-blue.yaml"
             fi
 
-            if ! kubectl get deployment $SERVICE_NAME-green >/dev/null 2>&1; then
-              kubectl apply -f $SERVICE_NAME-green.yaml
+            echo "Ensuring green deployment exists..."
+            if ! kubectl get deployment "$SERVICE_NAME-green" >/dev/null 2>&1; then
+              kubectl apply -f "$SERVICE_NAME-green.yaml"
             fi
 
-            kubectl apply -f $SERVICE_NAME-preview-services.yaml
+            echo "Ensuring preview services exist..."
+            kubectl apply -f "$SERVICE_NAME-preview-services.yaml"
 
-            if ! kubectl get service $SERVICE_NAME >/dev/null 2>&1; then
-              kubectl apply -f $SERVICE_NAME-stable-service.yaml
+            echo "Ensuring stable service exists..."
+            if ! kubectl get service "$SERVICE_NAME" >/dev/null 2>&1; then
+              kubectl apply -f "$SERVICE_NAME-stable-service.yaml"
             fi
 
-            ACTIVE_COLOR=$(kubectl get service $SERVICE_NAME -o jsonpath='{.spec.selector.color}')
+            ACTIVE_COLOR=$(kubectl get service "$SERVICE_NAME" -o jsonpath='{.spec.selector.color}')
 
             if [ -z "$ACTIVE_COLOR" ]; then
               echo "No active color found for $SERVICE_NAME. Defaulting to blue."
               ACTIVE_COLOR="blue"
-              kubectl patch service $SERVICE_NAME \
+
+              kubectl patch service "$SERVICE_NAME" \
                 --type=merge \
                 -p "{\"spec\":{\"selector\":{\"app\":\"$SERVICE_NAME\",\"color\":\"blue\"}}}"
             fi
@@ -115,36 +165,28 @@ jobs:
 
             echo "$SERVICE_NAME active color before deployment: $ACTIVE_COLOR"
             echo "$SERVICE_NAME target color: $TARGET_COLOR"
+            echo "$SERVICE_NAME old color: $OLD_COLOR"
 
-            kubectl set image deployment/$SERVICE_NAME-$TARGET_COLOR \
-              $CONTAINER_NAME=$IMAGE
+            echo "Updating $SERVICE_NAME-$TARGET_COLOR image..."
+            kubectl set image deployment/"$SERVICE_NAME-$TARGET_COLOR" \
+              "$CONTAINER_NAME=$IMAGE"
 
-            kubectl scale deployment $SERVICE_NAME-$TARGET_COLOR --replicas=1
+            echo "Scaling $SERVICE_NAME-$TARGET_COLOR to 1 replica..."
+            kubectl scale deployment "$SERVICE_NAME-$TARGET_COLOR" --replicas=1
 
-            kubectl rollout status deployment/$SERVICE_NAME-$TARGET_COLOR --timeout=180s
+            echo "Waiting for rollout..."
+            kubectl rollout status deployment/"$SERVICE_NAME-$TARGET_COLOR" --timeout=180s
 
-            kubectl run $SERVICE_NAME-smoke-test \
-              --rm -i \
-              --restart=Never \
-              --image=curlimages/curl:8.8.0 \
-              -- curl -f http://$SERVICE_NAME-$TARGET_COLOR-preview:8000$HEALTH_PATH
+            run_smoke_test \
+              "$SERVICE_NAME-$TARGET_COLOR-smoke-test" \
+              "http://$SERVICE_NAME-$TARGET_COLOR-preview:8000$HEALTH_PATH"
 
-            cat > /tmp/$SERVICE_NAME-service-patch.json <<PATCH
-          {
-            "spec": {
-              "selector": {
-                "app": "$SERVICE_NAME",
-                "color": "$TARGET_COLOR"
-              }
-            }
-          }
-          PATCH
-
-            kubectl patch service $SERVICE_NAME \
+            echo "Switching live traffic for $SERVICE_NAME to $TARGET_COLOR..."
+            kubectl patch service "$SERVICE_NAME" \
               --type=merge \
-              --patch-file /tmp/$SERVICE_NAME-service-patch.json
+              -p "{\"spec\":{\"selector\":{\"app\":\"$SERVICE_NAME\",\"color\":\"$TARGET_COLOR\"}}}"
 
-            CURRENT_COLOR=$(kubectl get service $SERVICE_NAME -o jsonpath='{.spec.selector.color}')
+            CURRENT_COLOR=$(kubectl get service "$SERVICE_NAME" -o jsonpath='{.spec.selector.color}')
 
             echo "$SERVICE_NAME current live color after patch: $CURRENT_COLOR"
 
@@ -153,23 +195,53 @@ jobs:
               exit 1
             fi
 
-            kubectl run $SERVICE_NAME-live-smoke-test \
-              --rm -i \
-              --restart=Never \
-              --image=curlimages/curl:8.8.0 \
-              -- curl -f http://$SERVICE_NAME:8000$HEALTH_PATH
+            run_smoke_test \
+              "$SERVICE_NAME-live-smoke-test" \
+              "http://$SERVICE_NAME:8000$HEALTH_PATH"
 
-            kubectl scale deployment $SERVICE_NAME-$OLD_COLOR --replicas=1
+            echo "Keeping old color available for rollback..."
+            kubectl scale deployment "$SERVICE_NAME-$OLD_COLOR" --replicas=1
 
             echo "$SERVICE_NAME deployment completed. Live color is now: $TARGET_COLOR"
           }
 
+          echo "Checking Kubernetes access..."
           kubectl get nodes
 
+          echo "STARTING BACKEND DEPLOYMENT CALLS"
+
+          echo "CALL 1: event-service"
           deploy_service "event-service" "event-service" "$EVENT_IMAGE" "/"
+          echo "DONE 1: event-service"
+
+          echo "CALL 2: program-service"
           deploy_service "program-service" "program-service" "$PROGRAM_IMAGE" "/"
+          echo "DONE 2: program-service"
+
+          echo "CALL 3: registration-service"
           deploy_service "registration-service" "registration-service" "$REGISTRATION_IMAGE" "/"
+          echo "DONE 3: registration-service"
+
+          echo "CALL 4: analytics-service"
           deploy_service "analytics-service" "analytics-service" "$ANALYTICS_IMAGE" "/analytics/health"
+          echo "DONE 4: analytics-service"
+
+          echo "ALL BACKEND SERVICES DEPLOYED"
+
+          echo "Verifying live backend images..."
+
+          for SERVICE_NAME in event-service program-service registration-service analytics-service; do
+            LIVE_COLOR=$(kubectl get service "$SERVICE_NAME" -o jsonpath='{.spec.selector.color}')
+            LIVE_IMAGE=$(kubectl get deployment "$SERVICE_NAME-$LIVE_COLOR" -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+            echo "$SERVICE_NAME live color: $LIVE_COLOR"
+            echo "$SERVICE_NAME live image: $LIVE_IMAGE"
+
+            if echo "$LIVE_IMAGE" | grep -E ':v[0-9]+$'; then
+              echo "$SERVICE_NAME is still using an old version tag. Deployment did not update correctly."
+              exit 1
+            fi
+          done
 
           echo "Backend deployments:"
           kubectl get deployments | grep service
