@@ -36,9 +36,14 @@ jobs:
       - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/new-event-key.pem
+          printf "%s\n" "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/new-event-key.pem
           chmod 600 ~/.ssh/new-event-key.pem
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+          echo "Testing SSH connection to EC2..."
+          nc -vz "${{ secrets.EC2_HOST }}" 22
+
+          echo "Adding EC2 host to known_hosts..."
+          ssh-keyscan -T 30 -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Copy blue-green manifests to EC2
         run: |
@@ -54,15 +59,38 @@ jobs:
 
           cd ~/new-event-k8s/frontend-blue-green
 
-          kubectl apply -f frontend-blue.yaml
-          kubectl apply -f frontend-green.yaml
+          echo "Using image: $IMAGE"
+
+          echo "Checking Kubernetes access..."
+          kubectl get nodes
+
+          echo "Ensuring blue deployment exists..."
+          if ! kubectl get deployment new-event-frontend-blue >/dev/null 2>&1; then
+            kubectl apply -f frontend-blue.yaml
+          fi
+
+          echo "Ensuring green deployment exists..."
+          if ! kubectl get deployment new-event-frontend-green >/dev/null 2>&1; then
+            kubectl apply -f frontend-green.yaml
+          fi
+
+          echo "Ensuring preview services exist..."
           kubectl apply -f frontend-preview-services.yaml
 
+          echo "Ensuring stable frontend service exists..."
           if ! kubectl get service new-event-frontend-service >/dev/null 2>&1; then
             kubectl apply -f frontend-stable-service.yaml
           fi
 
           ACTIVE_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
+
+          if [ -z "$ACTIVE_COLOR" ]; then
+            echo "No active color found. Defaulting to blue."
+            ACTIVE_COLOR="blue"
+            kubectl patch service new-event-frontend-service \
+              --type=merge \
+              -p '{"spec":{"selector":{"app":"new-event-frontend","color":"blue"}}}'
+          fi
 
           if [ "$ACTIVE_COLOR" = "blue" ]; then
             TARGET_COLOR="green"
@@ -72,25 +100,43 @@ jobs:
             OLD_COLOR="green"
           fi
 
-          echo "Active color: $ACTIVE_COLOR"
-          echo "Deploying new image to: $TARGET_COLOR"
-          echo "Image: $IMAGE"
+          echo "Active color before deployment: $ACTIVE_COLOR"
+          echo "Deploying new image to inactive color: $TARGET_COLOR"
+          echo "Old color: $OLD_COLOR"
 
+          echo "Updating target deployment image..."
           kubectl set image deployment/new-event-frontend-$TARGET_COLOR \
             new-event-frontend=$IMAGE
 
+          echo "Scaling target deployment to 1 replica..."
           kubectl scale deployment new-event-frontend-$TARGET_COLOR --replicas=1
 
+          echo "Waiting for target deployment rollout..."
           kubectl rollout status deployment/new-event-frontend-$TARGET_COLOR --timeout=180s
 
+          echo "Running smoke test against target preview service..."
           kubectl run frontend-smoke-test \
             --rm -i \
             --restart=Never \
             --image=curlimages/curl:8.8.0 \
             -- curl -f http://new-event-frontend-$TARGET_COLOR-preview/
 
+          echo "Switching live traffic to $TARGET_COLOR..."
+
+          cat > /tmp/frontend-service-patch.json <<PATCH
+          {
+            "spec": {
+              "selector": {
+                "app": "new-event-frontend",
+                "color": "$TARGET_COLOR"
+              }
+            }
+          }
+          PATCH
+
           kubectl patch service new-event-frontend-service \
-            -p "{\"spec\":{\"selector\":{\"app\":\"new-event-frontend\",\"color\":\"$TARGET_COLOR\"}}}"
+            --type=merge \
+            --patch-file /tmp/frontend-service-patch.json
 
           CURRENT_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
 
@@ -101,6 +147,31 @@ jobs:
             exit 1
           fi
 
-          echo "Deployment completed. Live color is now: $TARGET_COLOR"
+          echo "Running smoke test against stable live service..."
+          kubectl run frontend-live-smoke-test \
+            --rm -i \
+            --restart=Never \
+            --image=curlimages/curl:8.8.0 \
+            -- curl -f http://new-event-frontend-service/
+
+          echo "Keeping old color available for rollback..."
+          kubectl scale deployment new-event-frontend-$OLD_COLOR --replicas=1
+
+          echo "Deployment completed successfully."
+          echo "Live color is now: $TARGET_COLOR"
+
+          echo "Frontend deployments:"
+          kubectl get deployments | grep new-event-frontend
+
+          echo "Frontend pods:"
           kubectl get pods -l app=new-event-frontend --show-labels
+
+          echo "Stable service selector:"
+          kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector}'
+          echo ""
+
+          echo "Live deployment image:"
+          kubectl get deployment new-event-frontend-$TARGET_COLOR \
+            -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo ""
           EOF
