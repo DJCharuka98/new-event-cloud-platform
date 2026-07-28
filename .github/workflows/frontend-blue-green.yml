@@ -1,6 +1,8 @@
 name: Frontend Blue-Green Deployment
 
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - main
@@ -59,6 +61,49 @@ jobs:
 
           cd ~/new-event-k8s/frontend-blue-green
 
+          run_smoke_test() {
+            TEST_NAME=$1
+            TEST_URL=$2
+
+            echo "Running smoke test: $TEST_NAME"
+            echo "URL: $TEST_URL"
+
+            kubectl delete pod "$TEST_NAME" --ignore-not-found=true >/dev/null 2>&1 || true
+            kubectl wait --for=delete pod/"$TEST_NAME" --timeout=30s >/dev/null 2>&1 || true
+
+            kubectl run "$TEST_NAME" \
+              --restart=Never \
+              --image=curlimages/curl:8.8.0 \
+              --command -- sh -c "curl -fsS '$TEST_URL'"
+
+            for i in $(seq 1 60); do
+              PHASE=$(kubectl get pod "$TEST_NAME" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+
+              if [ "$PHASE" = "Succeeded" ]; then
+                echo "Smoke test succeeded: $TEST_NAME"
+                kubectl logs "$TEST_NAME" || true
+                kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+                return 0
+              fi
+
+              if [ "$PHASE" = "Failed" ]; then
+                echo "Smoke test failed: $TEST_NAME"
+                kubectl logs "$TEST_NAME" || true
+                kubectl describe pod "$TEST_NAME" || true
+                kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+                exit 1
+              fi
+
+              sleep 2
+            done
+
+            echo "Smoke test timed out: $TEST_NAME"
+            kubectl logs "$TEST_NAME" || true
+            kubectl describe pod "$TEST_NAME" || true
+            kubectl delete pod "$TEST_NAME" --ignore-not-found=true
+            exit 1
+          }
+
           echo "Using image: $IMAGE"
 
           echo "Checking Kubernetes access..."
@@ -115,28 +160,15 @@ jobs:
           kubectl rollout status deployment/new-event-frontend-$TARGET_COLOR --timeout=180s
 
           echo "Running smoke test against target preview service..."
-          kubectl run frontend-smoke-test \
-            --rm -i \
-            --restart=Never \
-            --image=curlimages/curl:8.8.0 \
-            -- curl -f http://new-event-frontend-$TARGET_COLOR-preview/
+          run_smoke_test \
+            "frontend-$TARGET_COLOR-smoke-test" \
+            "http://new-event-frontend-$TARGET_COLOR-preview/"
 
           echo "Switching live traffic to $TARGET_COLOR..."
 
-          cat > /tmp/frontend-service-patch.json <<PATCH
-          {
-            "spec": {
-              "selector": {
-                "app": "new-event-frontend",
-                "color": "$TARGET_COLOR"
-              }
-            }
-          }
-          PATCH
-
           kubectl patch service new-event-frontend-service \
             --type=merge \
-            --patch-file /tmp/frontend-service-patch.json
+            -p "{\"spec\":{\"selector\":{\"app\":\"new-event-frontend\",\"color\":\"$TARGET_COLOR\"}}}"
 
           CURRENT_COLOR=$(kubectl get service new-event-frontend-service -o jsonpath='{.spec.selector.color}')
 
@@ -148,11 +180,9 @@ jobs:
           fi
 
           echo "Running smoke test against stable live service..."
-          kubectl run frontend-live-smoke-test \
-            --rm -i \
-            --restart=Never \
-            --image=curlimages/curl:8.8.0 \
-            -- curl -f http://new-event-frontend-service/
+          run_smoke_test \
+            "frontend-live-smoke-test" \
+            "http://new-event-frontend-service/"
 
           echo "Keeping old color available for rollback..."
           kubectl scale deployment new-event-frontend-$OLD_COLOR --replicas=1
